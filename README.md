@@ -1,10 +1,15 @@
-# miniMerch NFT Studio (native Android)
+# miniMerch NFT Studio (native Android) — DEPRECATED
 
-The **NFT marketplace authoring tool** for miniMerch: import your own NFTs straight from your
+> **⚠️ Merged into [miniMall Studio](https://github.com/eurobuddha/minima-core-android-merchstudio) 0.3.0**
+> (package `com.eurobuddha.merchstudio`), which now has a **Products** tab (typed goods) and an
+> **NFTs** tab (this app's entire gallery/StateNFT feature set). Install miniMall Studio from
+> PandaApps; this app receives no further updates and is delisted from the store. Existing
+> installs keep working, but new features land only in miniMall Studio.
+
+The **NFT marketplace authoring tool** for miniMall: import your own NFTs straight from your
 Minima node's wallet, price them, and export a portable **`.shop`** catalog your customers open
-in the [miniMerch Shop](https://github.com/eurobuddha/minima-core-android-merchshop) app. A
-sibling of miniMerch Studio (which authors hand-typed products); part of the miniMerch family
-(Shop · Inbox · Studio · NFT Studio). Package `com.eurobuddha.merchnftstudio`.
+in the [miniMall](https://github.com/eurobuddha/minima-core-android-merchshop) app.
+Package `com.eurobuddha.merchnftstudio`.
 
 ## How it works
 
