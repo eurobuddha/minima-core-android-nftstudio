@@ -1,13 +1,17 @@
-<?xml version="1.0" encoding="utf-8"?><!--
-   Sample backup rules file; uncomment and customize as necessary.
-   See https://developer.android.com/guide/topics/data/autobackup
-   for details.
-   Note: This file is ignored for devices older than API 31
-   See https://developer.android.com/about/versions/12/backup-restore
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+   Legacy (API < 31) Auto Backup rules.
+
+   Nothing in this app needs to leave the device, and nothing here should survive a reinstall onto a node
+   with different keys. allowBackup="false" already disables this; the excludes are explicit so the intent
+   survives anyone flipping that flag back. What was being carried:
+   only cache-dir shop drafts; vendor identity is held in memory and re-fetched each launch. The shared
+         minima_api_prefs node pairing token was the one durable thing leaving the device
 -->
 <full-backup-content>
-    <!--
-   <include domain="sharedpref" path="."/>
-   <exclude domain="sharedpref" path="device.xml"/>
--->
+    <exclude domain="sharedpref" path="." />
+    <exclude domain="database" path="." />
+    <exclude domain="file" path="." />
+    <exclude domain="external" path="." />
+    <exclude domain="root" path="." />
 </full-backup-content>

@@ -3,6 +3,7 @@ package com.eurobuddha.merchnftstudio;
 import android.content.Intent;
 import android.graphics.Bitmap;
 import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
@@ -12,18 +13,22 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.content.FileProvider;
 import androidx.core.graphics.Insets;
 import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
+import androidx.recyclerview.widget.GridLayoutManager;
+import androidx.recyclerview.widget.RecyclerView;
 
 import com.goterl.lazysodium.LazySodium;
 
@@ -41,11 +46,19 @@ import java.io.FileWriter;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-/** miniMerch NFT Studio — list your own wallet NFTs for sale and export a portable .shop bundle. */
+/**
+ * miniMerch NFT Studio — an art-first gallery of the NFTs in YOUR wallet. Tap to list, price it,
+ * preview the exact buyer storefront, export a .shop. Delivery is on-chain and automatic: the
+ * buyer's wallet address rides in the order, and miniMall Inbox sends the NFT on confirmed payment.
+ */
 public class MainActivity extends AppCompatActivity {
 
     private LazySodium ls;
@@ -53,42 +66,65 @@ public class MainActivity extends AppCompatActivity {
     private boolean paired = false;
     private String vendorPublicId = "", vendorAddress = "";
 
-    private String shopName = "";
+    private String shopName = "", about = "";
     private String currency = "Minima", tokenid = CommsTransport.MINIMA;
-    private final java.util.List<Catalog.Shipping> shipping = new java.util.ArrayList<>();
 
-    /** One row per wallet NFT (0-decimal non-Minima token we hold). Keyed by tokenid; a Refresh
-     *  merges fresh balance rows in while PRESERVING the vendor's selection + edits. */
+    /** One row per listable NFT. Keyed by tokenid for plain NFTs, tokenid#idx for StateNFT pieces.
+     *  A Refresh merges fresh data in while PRESERVING the vendor's listings + edits. */
     private final LinkedHashMap<String, NftListing> listings = new LinkedHashMap<>();
+    /** StateNFT collections detected in the wallet (script-fingerprinted), keyed by tokenid. */
+    private final LinkedHashMap<String, StateCollection> collections = new LinkedHashMap<>();
+    /** Memoized `tokens tokenid:` records — token scripts are immutable, fetch once per process. */
+    private final java.util.HashMap<String, JSONObject> tokenRecords = new java.util.HashMap<>();
+    private final java.util.HashSet<String> fetchingRecords = new java.util.HashSet<>();
     private boolean nftsLoading = false, nftsLoaded = false;
     private boolean exporting = false;
 
-    private static final int MAX_PRODUCTS = 40;   // same cap as the .shop schema / miniMerch Studio
+    private static final int MAX_PRODUCTS = 40;   // .shop schema cap
 
     private final ExecutorService io = Executors.newSingleThreadExecutor();
     private final Handler ui = new Handler(Looper.getMainLooper());
 
-    private LinearLayout root, form;
-    private TextView cardStatus;
+    private final ArrayDeque<View> stack = new ArrayDeque<>();
+    private LinearLayout root;
+    private FrameLayout container;
 
-    /** A wallet NFT with the vendor's listing edits layered on top of the token metadata. */
+    /** A wallet NFT with the vendor's listing edits layered on top of the token metadata.
+     *  Plain NFT: bal set, stateIdx 0. StateNFT piece: stateIdx ≥ 1, coinRaw + snMeta set, bal null. */
     private static final class NftListing {
+        String tokenid = "";
         TokenBalance bal;
-        boolean selected = false;
+        int stateIdx = 0;                     // ≥1 = a piece of a StateNFT collection
+        JSONObject coinRaw;                   // the piece's raw coin (byte-exact state)
+        StateNft.Meta snMeta;                 // the piece's collection metadata
+        boolean listed = false;
         String name = "", description = "";   // prefilled from token metadata, editable
         String price = "";
         String units = "";                    // editions to offer, default = sendable holding
         String cachedB64 = "";                // resolved shop image (bare base64 JPEG), lazily built
     }
 
+    /** A StateNFT collection in the wallet: one tokenid, one coin per piece, art in coin state. */
+    private static final class StateCollection {
+        String tokenid = "";
+        StateNft.Meta meta;
+        boolean legacy = false;               // pre-SAMESTATE contract — creator can still rewrite state
+        final java.util.List<JSONObject> ownedCoins = new java.util.ArrayList<>();  // stamped + replayable
+        int unstampedCount = 0;
+        boolean coinsLoading = false, coinsLoaded = false, tooLong = false;
+    }
+
+    // ---- lifecycle ----
+
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
         ls = Sodium.get();
-        seedDefaults();
 
         root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(Design.BG);
+        container = new FrameLayout(this);
+        root.addView(container, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
         setContentView(root);
         ViewCompat.setOnApplyWindowInsetsListener(root, (v, insets) -> {
             Insets bars = insets.getInsets(WindowInsetsCompat.Type.systemBars());
@@ -98,21 +134,33 @@ public class MainActivity extends AppCompatActivity {
         });
         new WindowInsetsControllerCompat(getWindow(), root).setAppearanceLightStatusBars(false);
 
-        buildScreen();
+        showGallery();
         node = new NodeApi(this, this::onPaired);
     }
 
     @Override protected void onDestroy() { super.onDestroy(); if (node != null) node.onDestroy(); io.shutdownNow(); }
 
-    private void seedDefaults() {
-        if (!shipping.isEmpty()) return;
-        // NFTs are delivered on-chain to the buyer's pay address — one digital option, still editable.
-        Catalog.Shipping x = new Catalog.Shipping();
-        x.id = "digital"; x.label = "Digital / on-chain delivery"; x.fee = "0";
-        shipping.add(x);
+    @Override public void onBackPressed() {
+        if (stack.size() > 1) pop(); else super.onBackPressed();
+    }
+
+    // ---- navigation (view stack, as in miniMall) ----
+
+    private void push(View v) { stack.push(v); showTop(); }
+    private void pop() { if (stack.size() > 1) { stack.pop(); showTop(); } }
+    private void showGallery() { stack.clear(); stack.push(buildGallery()); showTop(); }
+    private void showTop() { container.removeAllViews(); container.addView(stack.peek()); }
+    private void refreshTop(View rebuilt) { stack.pop(); stack.push(rebuilt); showTop(); }
+    private void refreshIfTag(String tag) {
+        View top = stack.peek();
+        if (top != null && tag.equals(top.getTag())) {
+            if ("gallery".equals(tag)) refreshTop(buildGallery());
+            else if ("shop".equals(tag)) refreshTop(buildShopDetails());
+        }
     }
 
     // ---- identity (vendor card) ----
+
     private void onPaired(boolean enabled) {
         paired = enabled;
         if (enabled && vendorPublicId.isEmpty()) {
@@ -127,13 +175,13 @@ public class MainActivity extends AppCompatActivity {
             node.cmd("getaddress", new NodeApi.Cb() {
                 @Override public void onResult(JSONObject j) {
                     JSONObject r = j.optJSONObject("response");
-                    if (r != null) { vendorAddress = r.optString("miniaddress", r.optString("address", "")); refreshCardStatus(); }
+                    if (r != null) { vendorAddress = r.optString("miniaddress", r.optString("address", "")); refreshIfTag("gallery"); }
                 }
                 @Override public void onError(String m) {}
             });
         }
         if (enabled) loadNfts();
-        refreshCardStatus();
+        refreshIfTag("gallery");
     }
 
     private void deriveCard(final String ikm) {
@@ -141,7 +189,7 @@ public class MainActivity extends AppCompatActivity {
             try {
                 byte[] seed = ikm.startsWith("0x") ? Hex.from(ikm) : ikm.getBytes(StandardCharsets.UTF_8);
                 String pid = CommsIdentity.fromSeed(ls, seed).publicId();
-                ui.post(() -> { vendorPublicId = pid; refreshCardStatus(); });
+                ui.post(() -> { vendorPublicId = pid; refreshIfTag("gallery"); });
             } catch (Exception e) { ui.post(() -> toast("Identity error: " + e.getMessage())); }
         });
     }
@@ -150,34 +198,31 @@ public class MainActivity extends AppCompatActivity {
         return CommsIdentity.isValidPublicId(vendorPublicId) && vendorAddress != null && !vendorAddress.isEmpty();
     }
 
-    private void refreshCardStatus() {
-        if (cardStatus == null) return;
-        if (cardReady()) { cardStatus.setText("✓ Shop key ready (from this node's seed)"); cardStatus.setTextColor(Design.IN); }
-        else if (!paired) { cardStatus.setText("Enable miniMerch NFT Studio in Minima Core → Apps."); cardStatus.setTextColor(Design.ACCENT); }
-        else { cardStatus.setText("Connecting to your node…"); cardStatus.setTextColor(Design.DIM); }
-    }
-
     // ---- wallet NFTs ----
+
     private void loadNfts() {
         if (nftsLoading) return;
         nftsLoading = true;
-        rebuildForm();
+        refreshIfTag("gallery");
         node.cmd("balance", new NodeApi.Cb() {
             @Override public void onResult(JSONObject j) {
                 nftsLoading = false; nftsLoaded = true;
                 mergeBalances(j.optJSONArray("response"));
-                rebuildForm();
+                refreshIfTag("gallery");
             }
             @Override public void onError(String m) {
                 nftsLoading = false;
                 if (!NodeApi.ERR_NOT_ENABLED.equals(m)) toast("Couldn't read wallet: " + m);
-                rebuildForm();
+                refreshIfTag("gallery");
             }
         });
     }
 
-    /** Keep every 0-decimal non-Minima token we can currently send; carry existing edits across. */
+    /** Keep every 0-decimal non-Minima token we can currently send; carry existing edits across.
+     *  StateNFT collections (script-fingerprinted via ensureRecord) are promoted OUT of the plain
+     *  list — their individual pieces are enumerated per-coin by loadCollectionCoins. */
     private void mergeBalances(JSONArray rows) {
+        java.util.HashSet<String> seen = new java.util.HashSet<>();
         LinkedHashMap<String, NftListing> fresh = new LinkedHashMap<>();
         if (rows != null) for (int i = 0; i < rows.length(); i++) {
             JSONObject row = rows.optJSONObject(i);
@@ -188,6 +233,10 @@ public class MainActivity extends AppCompatActivity {
             if (!(d.isEmpty() || d.equals("0"))) continue;           // fungible token — not listable here
             BigInteger held = wholeUnits(t.sendable);
             if (held.signum() <= 0) continue;                        // nothing spendable (yet)
+            if (!Util.isValidHexId(t.tokenid)) continue;
+            seen.add(t.tokenid);
+            ensureRecord(t.tokenid);                                  // memoized script fingerprint
+            if (collections.containsKey(t.tokenid)) continue;         // a collection, not a plain row
             NftListing l = listings.get(t.tokenid);
             if (l == null) {
                 l = new NftListing();
@@ -195,190 +244,721 @@ public class MainActivity extends AppCompatActivity {
                 l.description = t.meta.description == null ? "" : t.meta.description;
                 l.units = held.toString();
             }
+            l.tokenid = t.tokenid;
             l.bal = t;
             fresh.put(t.tokenid, l);
+        }
+        // Drop collections that vanished from the wallet (with their piece listings); refresh the rest.
+        for (java.util.Iterator<Map.Entry<String, StateCollection>> it = collections.entrySet().iterator(); it.hasNext(); ) {
+            Map.Entry<String, StateCollection> e = it.next();
+            if (!seen.contains(e.getKey())) {
+                it.remove();
+                listings.keySet().removeIf(k -> k.startsWith(e.getKey() + "#"));
+            } else {
+                loadCollectionCoins(e.getValue());
+            }
+        }
+        // Carry surviving piece listings across the rebuild (managed by loadCollectionCoins).
+        for (Map.Entry<String, NftListing> e : listings.entrySet()) {
+            if (e.getKey().contains("#") && collections.containsKey(e.getValue().tokenid)) fresh.put(e.getKey(), e.getValue());
         }
         listings.clear();
         listings.putAll(fresh);
     }
 
-    /** Whole units in a balance amount string ("3", "3.0"); zero on anything unparseable. */
+    /** Fetch (once per process) the token record and promote StateNFT collections. */
+    private void ensureRecord(final String tokenid) {
+        if (tokenRecords.containsKey(tokenid) || fetchingRecords.contains(tokenid)) return;
+        fetchingRecords.add(tokenid);
+        node.cmd("tokens tokenid:" + tokenid, new NodeApi.Cb() {
+            @Override public void onResult(JSONObject j) {
+                fetchingRecords.remove(tokenid);
+                Object resp = j.opt("response");
+                JSONObject tok = null;
+                if (resp instanceof JSONObject) tok = (JSONObject) resp;
+                else if (resp instanceof JSONArray && ((JSONArray) resp).length() > 0) tok = ((JSONArray) resp).optJSONObject(0);
+                if (tok == null) return;
+                tokenRecords.put(tokenid, tok);
+                String script = tok.optString("script", "");
+                if (!StateNft.isStateNftScript(script)) return;
+                StateCollection col = new StateCollection();
+                col.tokenid = tokenid;
+                col.meta = StateNft.parseMeta(tokenid, tok);
+                col.legacy = !script.startsWith("LET s=PREVSTATE");
+                collections.put(tokenid, col);
+                listings.remove(tokenid);                     // no longer a plain aggregate row
+                loadCollectionCoins(col);
+                refreshIfTag("gallery");
+            }
+            @Override public void onError(String m) { fetchingRecords.remove(tokenid); }
+        });
+    }
+
+    /** Enumerate the collection's coins in this wallet (bounded per-token query); rebuild piece
+     *  listings keyed tokenid#idx, PRESERVING listing edits (the coinid churns, the idx doesn't). */
+    private void loadCollectionCoins(final StateCollection col) {
+        if (col.coinsLoading) return;
+        col.coinsLoading = true;
+        node.cmd("coins relevant:true tokenid:" + col.tokenid, new NodeApi.Cb() {
+            @Override public void onResult(JSONObject j) {
+                col.coinsLoading = false; col.coinsLoaded = true; col.tooLong = false;
+                col.ownedCoins.clear(); col.unstampedCount = 0;
+                java.util.HashSet<String> liveKeys = new java.util.HashSet<>();
+                JSONArray arr = j.optJSONArray("response");
+                if (arr != null) for (int i = 0; i < arr.length(); i++) {
+                    JSONObject c = arr.optJSONObject(i);
+                    if (c == null || !Util.isValidHexId(c.optString("coinid", ""))) continue;
+                    String idx = StateNft.stamped(c);
+                    if (idx == null) { col.unstampedCount++; continue; }          // sentinel — not listable
+                    if (!idx.matches("^[0-9]+$") || !StateNft.replayableState(c)) continue;  // hostile state
+                    col.ownedCoins.add(c);
+                    String key = col.tokenid + "#" + idx;
+                    liveKeys.add(key);
+                    NftListing l = listings.get(key);
+                    if (l == null) {
+                        l = new NftListing();
+                        l.name = col.meta.name + " #" + idx;
+                        l.description = col.meta.description == null ? "" : col.meta.description;
+                        l.units = "1";
+                        listings.put(key, l);
+                    }
+                    l.tokenid = col.tokenid;
+                    l.stateIdx = Integer.parseInt(idx);
+                    l.coinRaw = c;
+                    l.snMeta = col.meta;
+                }
+                // pieces that left the wallet are no longer listable
+                listings.keySet().removeIf(k -> k.startsWith(col.tokenid + "#") && !liveKeys.contains(k));
+                refreshIfTag("gallery");
+                refreshIfCollection(col.tokenid);
+            }
+            @Override public void onError(String m) {
+                col.coinsLoading = false;
+                if (NodeApi.ERR_TOO_LONG.equals(m)) col.tooLong = true;
+                refreshIfTag("gallery");
+                refreshIfCollection(col.tokenid);
+            }
+        });
+    }
+
+    private void refreshIfCollection(String tokenid) {
+        View top = stack.peek();
+        if (top != null && ("collection:" + tokenid).equals(top.getTag())) {
+            StateCollection col = collections.get(tokenid);
+            if (col != null) refreshTop(buildCollectionGrid(col));
+        }
+    }
+
     private static BigInteger wholeUnits(String amount) {
         try { return new BigDecimal(amount == null ? "0" : amount.trim()).toBigInteger(); }
         catch (Exception e) { return BigInteger.ZERO; }
     }
 
-    private int selectedCount() {
-        int n = 0;
-        for (NftListing l : listings.values()) if (l.selected) n++;
-        return n;
+    private List<NftListing> listedItems() {
+        List<NftListing> out = new ArrayList<>();
+        for (NftListing l : listings.values()) if (l.listed) out.add(l);
+        return out;
     }
 
-    // ---- the editor form ----
-    private void buildScreen() {
-        root.removeAllViews();
-        root.addView(header("miniMerch NFT Studio"));
-        ScrollView sv = new ScrollView(this);
-        form = new LinearLayout(this); form.setOrientation(LinearLayout.VERTICAL); form.setPadding(dp(16), dp(8), dp(16), dp(28));
-        sv.addView(form);
-        root.addView(sv, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
-        rebuildForm();
+    private String displayName(NftListing l) {
+        String n = l.name == null ? "" : l.name.trim();
+        if (!n.isEmpty()) return n;
+        if (l.stateIdx > 0) return l.snMeta.name + " #" + l.stateIdx;
+        return l.bal == null || l.bal.meta.name == null ? "NFT" : l.bal.meta.name;
     }
 
-    private void rebuildForm() {
-        if (form == null) return;
-        form.removeAllViews();
+    private String editionChip(NftListing l) {
+        if (l.stateIdx > 0) return "◈ #" + l.stateIdx + " / " + l.snMeta.size;
+        BigInteger supply = wholeUnits(l.bal.total);
+        return BigInteger.ONE.equals(supply) ? "◈ 1 of 1" : "◈ ×" + supply + " eds";
+    }
 
-        cardStatus = new TextView(this); cardStatus.setTextSize(12f); cardStatus.setPadding(0, 0, 0, dp(10));
-        form.addView(cardStatus); refreshCardStatus();
+    /** The piece's art URI (embedded state art > url-mode > collection icon). */
+    private String pieceImageUrl(NftListing l) {
+        return StateNft.imageUrl(l.snMeta, l.stateIdx, l.coinRaw);
+    }
 
-        form.addView(sectionLabel("Shop name"));
-        form.addView(field(shopName, "e.g. Zebra Gallery", s -> shopName = s));
+    /** Art source for any listing/collection card; empty string = identicon only. */
+    private String artUrlOf(NftListing l) {
+        if (l.stateIdx > 0) { String u = pieceImageUrl(l); return u == null ? "" : u; }
+        return l.bal != null && l.bal.hasIcon() ? l.bal.meta.iconUrl : "";
+    }
 
-        form.addView(sectionLabel("Currency"));
-        LinearLayout cur = new LinearLayout(this); cur.setOrientation(LinearLayout.HORIZONTAL);
-        cur.addView(seg("Minima", currency.equals("Minima"), () -> { currency = "Minima"; tokenid = CommsTransport.MINIMA; rebuildForm(); }));
-        cur.addView(seg("mxUSDT", currency.equals("USDT"), () -> { currency = "USDT"; tokenid = CommsTransport.USDT; rebuildForm(); }));
-        form.addView(cur);
+    private String identiconKey(NftListing l) {
+        return l.stateIdx > 0 ? l.tokenid + "#" + l.stateIdx : l.tokenid;
+    }
 
-        form.addView(sectionLabel("Shipping (label + fee)"));
-        for (final Catalog.Shipping s : shipping) {
-            LinearLayout row = new LinearLayout(this); row.setOrientation(LinearLayout.HORIZONTAL); row.setGravity(Gravity.CENTER_VERTICAL);
-            EditText label = field(s.label, "Label", v -> s.label = v); label.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-            EditText fee = field(s.fee, "0", v -> s.fee = v); fee.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
-            LinearLayout.LayoutParams fl = new LinearLayout.LayoutParams(dp(90), ViewGroup.LayoutParams.WRAP_CONTENT); fl.leftMargin = dp(8); fee.setLayoutParams(fl);
-            row.addView(label); row.addView(fee); form.addView(row);
-        }
+    private String currencyLabel() { return "USDT".equals(currency) ? "mxUSDT" : "Minima"; }
 
-        // ---- wallet NFTs ----
+    private boolean priced(NftListing l) {
+        try { return new BigDecimal(l.price.trim()).signum() > 0; } catch (Exception e) { return false; }
+    }
+
+    // ==== SCREEN 1 · Gallery ====
+
+    private View buildGallery() {
+        LinearLayout col = column();
+        col.setTag("gallery");
+        col.addView(header("miniMerch NFT Studio", false));
+
+        TextView status = new TextView(this);
+        status.setTextSize(12f); status.setPadding(dp(16), dp(6), dp(16), dp(4));
+        if (cardReady()) { status.setText("✓ Shop key ready (from this node's seed)"); status.setTextColor(Design.IN); }
+        else if (!paired) { status.setText("Enable miniMerch NFT Studio in Minima Core → Apps."); status.setTextColor(Design.ACCENT); }
+        else { status.setText("Connecting to your node…"); status.setTextColor(Design.DIM); }
+        col.addView(status);
+
         LinearLayout nh = new LinearLayout(this); nh.setOrientation(LinearLayout.HORIZONTAL); nh.setGravity(Gravity.CENTER_VERTICAL);
-        TextView nl = sectionLabel("Wallet NFTs  (" + listings.size() + ")");
+        nh.setPadding(dp(16), dp(8), dp(16), dp(4));
+        TextView nl = new TextView(this);
+        nl.setText(("Your wallet · " + listings.size() + (listings.size() == 1 ? " NFT" : " NFTs")).toUpperCase());
+        nl.setTextColor(Design.DIM2); nl.setTextSize(11f); nl.setTypeface(null, Typeface.BOLD);
         nl.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         nh.addView(nl);
-        TextView refresh = button(nftsLoading ? "…" : "↻ Refresh", false);
+        TextView refresh = button(nftsLoading ? "…" : "↻", false);
+        refresh.setPadding(dp(12), dp(6), dp(12), dp(6));
         refresh.setOnClickListener(v -> { if (paired) loadNfts(); else toast("Connect your node first."); });
         nh.addView(refresh);
-        form.addView(nh);
+        col.addView(nh);
+
+        List<Object> cards = new ArrayList<>(collections.values());
+        for (Map.Entry<String, NftListing> e : listings.entrySet())
+            if (!e.getKey().contains("#")) cards.add(e.getValue());
 
         if (!paired) {
-            form.addView(hint("Enable this app in Minima Core → Apps to read your wallet."));
-        } else if (nftsLoading && listings.isEmpty()) {
-            form.addView(hint("Reading your wallet…"));
-        } else if (listings.isEmpty() && nftsLoaded) {
-            form.addView(hint("No NFTs found in this wallet. NFTs are tokens minted with decimals:0; freshly minted ones appear once confirmed."));
+            col.addView(hint("Enable this app in Minima Core → Apps to read your wallet."));
+            col.addView(spacerWeight());
+        } else if (nftsLoading && cards.isEmpty()) {
+            col.addView(hint("Reading your wallet…"));
+            col.addView(spacerWeight());
+        } else if (cards.isEmpty() && nftsLoaded) {
+            col.addView(hint("No NFTs found in this wallet.\n\nNFTs are Minima tokens minted with decimals:0. Freshly minted ones appear once confirmed."));
+            col.addView(spacerWeight());
         } else {
-            form.addView(hint("Tick the NFTs to sell. Freshly minted tokens appear once confirmed."));
-            for (NftListing l : listings.values()) form.addView(nftCard(l));
+            col.addView(hint("Tap an NFT to list it for sale — collections open into their pieces."));
+            RecyclerView rv = new RecyclerView(this);
+            rv.setLayoutManager(new GridLayoutManager(this, 2));
+            rv.setPadding(dp(10), dp(4), dp(10), dp(10));
+            rv.setClipToPadding(false);
+            rv.setAdapter(new GalleryAdapter(cards, true));
+            col.addView(rv, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
         }
 
-        TextView export = button(exporting ? "Preparing images…" : "Export shop (.shop)", true);
-        LinearLayout.LayoutParams el = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        el.topMargin = dp(22); export.setLayoutParams(el); export.setPadding(dp(16), dp(14), dp(16), dp(14));
-        export.setOnClickListener(v -> exportShop());
-        form.addView(export);
+        int listed = listedItems().size();
+        TextView cont = button(listed == 0 ? "List an NFT to continue" : "Continue · " + listed + " listed  →", listed > 0);
+        LinearLayout.LayoutParams cl = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        cl.setMargins(dp(16), dp(8), dp(16), dp(14)); cont.setLayoutParams(cl);
+        cont.setPadding(dp(16), dp(13), dp(16), dp(13));
+        cont.setOnClickListener(v -> { if (!listedItems().isEmpty()) push(buildShopDetails()); });
+        col.addView(cont);
+        return col;
     }
 
-    private View nftCard(final NftListing l) {
-        LinearLayout card = new LinearLayout(this); card.setOrientation(LinearLayout.VERTICAL);
-        card.setBackground(Design.roundBg(this, Design.SURFACE, 12)); card.setPadding(dp(12), dp(12), dp(12), dp(12));
-        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        clp.topMargin = dp(8); card.setLayoutParams(clp);
+    /** 2-col art grid over NftListing and StateCollection cards.
+     *  galleryMode=true → studio cards (tap to list/edit); false → buyer-style preview. */
+    private class GalleryAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
+        final List<Object> data;
+        final boolean galleryMode;
+        GalleryAdapter(List<? extends Object> d, boolean galleryMode) { this.data = new ArrayList<>(d); this.galleryMode = galleryMode; }
 
-        LinearLayout top = new LinearLayout(this); top.setOrientation(LinearLayout.HORIZONTAL); top.setGravity(Gravity.CENTER_VERTICAL);
-
-        TextView tick = new TextView(this); tick.setText(l.selected ? "✓" : ""); tick.setGravity(Gravity.CENTER);
-        tick.setTextColor(Design.ON_ACCENT); tick.setTextSize(15f); tick.setTypeface(null, Typeface.BOLD);
-        tick.setBackground(Design.roundBg(this, l.selected ? Design.ACCENT : Design.SURFACE2, 7));
-        LinearLayout.LayoutParams tkl = new LinearLayout.LayoutParams(dp(26), dp(26)); tkl.rightMargin = dp(10); tick.setLayoutParams(tkl);
-        top.addView(tick);
-
-        ImageView thumb = new ImageView(this); thumb.setScaleType(ImageView.ScaleType.CENTER_CROP);
-        thumb.setBackground(Design.roundBg(this, Design.SURFACE2, 8)); thumb.setClipToOutline(true);
-        LinearLayout.LayoutParams tl = new LinearLayout.LayoutParams(dp(54), dp(54)); tl.rightMargin = dp(10); thumb.setLayoutParams(tl);
-        thumb.setImageBitmap(Identicon.forToken(l.bal.tokenid, dp(54)));
-        if (l.bal.hasIcon()) ImageLoader.loadOver(this, l.bal.meta.iconUrl, thumb, null);
-        top.addView(thumb);
-
-        LinearLayout tt = new LinearLayout(this); tt.setOrientation(LinearLayout.VERTICAL);
-        tt.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        TextView nm = new TextView(this); nm.setText(l.name.isEmpty() ? l.bal.meta.name : l.name);
-        nm.setTextColor(Design.TEXT); nm.setTextSize(15f); nm.setTypeface(null, Typeface.BOLD); tt.addView(nm);
-        TextView sub = new TextView(this);
-        String tkr = l.bal.meta.ticker == null || l.bal.meta.ticker.isEmpty() ? "" : l.bal.meta.ticker + " · ";
-        sub.setText(tkr + "you hold " + wholeUnits(l.bal.sendable) + " of " + wholeUnits(l.bal.total));
-        sub.setTextColor(Design.DIM); sub.setTextSize(12f); tt.addView(sub);
-        top.addView(tt);
-        card.addView(top);
-
-        View.OnClickListener toggle = v -> {
-            if (!l.selected && selectedCount() >= MAX_PRODUCTS) { toast("A shop holds at most " + MAX_PRODUCTS + " products."); return; }
-            l.selected = !l.selected;
-            rebuildForm();
-        };
-        tick.setOnClickListener(toggle);
-        top.setOnClickListener(toggle);
-
-        if (l.selected) {
-            card.addView(field(l.name, "Listing name", v -> l.name = v));
-            card.addView(field(l.description, "Description (optional)", v -> l.description = v));
-
-            LinearLayout pr = new LinearLayout(this); pr.setOrientation(LinearLayout.HORIZONTAL); pr.setGravity(Gravity.CENTER_VERTICAL);
-            pr.addView(tag("Price")); EditText price = field(l.price, "0", v -> l.price = v);
-            price.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
-            price.setLayoutParams(smLp()); pr.addView(price);
-            pr.addView(tag("  Sell")); EditText units = field(l.units, "1", v -> l.units = v);
-            units.setInputType(InputType.TYPE_CLASS_NUMBER); units.setLayoutParams(smLp()); pr.addView(units);
-            pr.addView(tag("of " + wholeUnits(l.bal.sendable)));
-            card.addView(pr);
-
-            TextView tid = new TextView(this); tid.setText(Util.shorten(l.bal.tokenid));
-            tid.setTextColor(Design.DIM2); tid.setTextSize(11f); tid.setPadding(0, dp(6), 0, 0);
-            card.addView(tid);
+        @Override public RecyclerView.ViewHolder onCreateViewHolder(ViewGroup p, int t) {
+            return new RecyclerView.ViewHolder(nftCardShell()) {};
         }
+
+        @Override public void onBindViewHolder(RecyclerView.ViewHolder h, int pos) {
+            Object item = data.get(pos);
+            if (item instanceof StateCollection) bindCollectionCard((LinearLayout) h.itemView, (StateCollection) item);
+            else bindNftCard((LinearLayout) h.itemView, (NftListing) item, galleryMode);
+        }
+
+        @Override public int getItemCount() { return data.size(); }
+    }
+
+    /** Collection card: icon art, name, "◈ N pieces · you hold M", listed count. Tap → piece grid. */
+    private void bindCollectionCard(LinearLayout card, final StateCollection col) {
+        card.removeAllViews();
+        LinearLayout inner = new LinearLayout(this);
+        inner.setOrientation(LinearLayout.VERTICAL);
+        int listed = 0;
+        for (NftListing l : listings.values()) if (l.listed && l.stateIdx > 0 && col.tokenid.equals(l.tokenid)) listed++;
+        inner.setBackground(cardBg(listed > 0));
+        inner.setPadding(dp(6), dp(6), dp(6), dp(10));
+        LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        ilp.setMargins(dp(6), dp(6), dp(6), dp(6));
+        inner.setLayoutParams(ilp);
+
+        ImageView art = squareImage();
+        art.setImageBitmap(Identicon.forToken(col.tokenid, dp(160)));
+        String icon = IconResolver.resolve(col.meta.icon);
+        if (icon != null && !icon.isEmpty()) ImageLoader.loadOver(this, icon, art, null);
+        inner.addView(art, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        TextView nm = new TextView(this);
+        nm.setText(col.meta.name); nm.setTextColor(Design.TEXT); nm.setTextSize(14f); nm.setTypeface(null, Typeface.BOLD);
+        nm.setSingleLine(true); nm.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        nm.setPadding(dp(4), dp(8), dp(4), 0);
+        inner.addView(nm);
+
+        TextView ed = new TextView(this);
+        ed.setText("◈ " + col.meta.size + " pieces · you hold " + col.ownedCoins.size());
+        ed.setTextColor(Design.DIM); ed.setTextSize(11.5f); ed.setPadding(dp(4), dp(2), dp(4), 0);
+        inner.addView(ed);
+
+        TextView pr = new TextView(this);
+        pr.setText(col.coinsLoading && !col.coinsLoaded ? "reading pieces…" : (listed > 0 ? listed + " listed" : "tap to view pieces"));
+        pr.setTextColor(listed > 0 ? Design.ACCENT : Design.DIM2);
+        if (listed > 0) pr.setTypeface(null, Typeface.BOLD);
+        pr.setTextSize(13f); pr.setPadding(dp(4), dp(2), dp(4), 0);
+        inner.addView(pr);
+
+        inner.setOnClickListener(v -> push(buildCollectionGrid(col)));
+        card.addView(inner);
+    }
+
+    /** Card shell: square art on top, text block under. Rebuilt cheaply on bind. */
+    private LinearLayout nftCardShell() {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        RecyclerView.LayoutParams lp = new RecyclerView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        card.setLayoutParams(lp);
         return card;
     }
 
-    // ---- export ----
+    private void bindNftCard(LinearLayout card, final NftListing l, boolean galleryMode) {
+        card.removeAllViews();
+        LinearLayout inner = new LinearLayout(this);
+        inner.setOrientation(LinearLayout.VERTICAL);
+        inner.setBackground(cardBg(galleryMode && l.listed));
+        inner.setPadding(dp(6), dp(6), dp(6), dp(10));
+        LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        ilp.setMargins(dp(6), dp(6), dp(6), dp(6));
+        inner.setLayoutParams(ilp);
+
+        // square art
+        FrameLayout artWrap = new FrameLayout(this);
+        ImageView art = squareImage();
+        art.setImageBitmap(Identicon.forToken(identiconKey(l), dp(160)));
+        String artUrl = artUrlOf(l);
+        if (!artUrl.isEmpty()) ImageLoader.loadOver(this, artUrl, art, null);
+        artWrap.addView(art, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        if (galleryMode && l.listed) {
+            TextView tick = new TextView(this);
+            tick.setText("✓"); tick.setTextColor(Design.ON_ACCENT); tick.setTextSize(13f); tick.setTypeface(null, Typeface.BOLD);
+            tick.setGravity(Gravity.CENTER); tick.setBackground(Design.roundBg(this, Design.ACCENT, 12));
+            FrameLayout.LayoutParams tl = new FrameLayout.LayoutParams(dp(24), dp(24), Gravity.TOP | Gravity.END);
+            tl.setMargins(0, dp(6), dp(6), 0); tick.setLayoutParams(tl);
+            artWrap.addView(tick);
+        }
+        inner.addView(artWrap);
+
+        TextView nm = new TextView(this);
+        nm.setText(displayName(l)); nm.setTextColor(Design.TEXT); nm.setTextSize(14f); nm.setTypeface(null, Typeface.BOLD);
+        nm.setSingleLine(true); nm.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        nm.setPadding(dp(4), dp(8), dp(4), 0);
+        inner.addView(nm);
+
+        TextView ed = new TextView(this);
+        ed.setText(editionChip(l)); ed.setTextColor(Design.DIM); ed.setTextSize(11.5f);
+        ed.setPadding(dp(4), dp(2), dp(4), 0);
+        inner.addView(ed);
+
+        TextView pr = new TextView(this);
+        if (galleryMode) {
+            if (l.listed && priced(l)) { pr.setText(Util.tidyAmount(l.price) + " " + currencyLabel()); pr.setTextColor(Design.ACCENT); pr.setTypeface(null, Typeface.BOLD); }
+            else if (l.listed) { pr.setText("listed — set a price"); pr.setTextColor(Design.ACCENT); }
+            else { pr.setText("unlisted"); pr.setTextColor(Design.DIM2); }
+        } else {
+            pr.setText(Util.tidyAmount(l.price) + " " + currencyLabel());
+            pr.setTextColor(Design.ACCENT); pr.setTypeface(null, Typeface.BOLD);
+        }
+        pr.setTextSize(13f); pr.setPadding(dp(4), dp(2), dp(4), 0);
+        inner.addView(pr);
+
+        if (galleryMode) {
+            inner.setOnClickListener(v -> {
+                if (!l.listed && listedItems().size() >= MAX_PRODUCTS) { toast("A shop holds at most " + MAX_PRODUCTS + " listings."); return; }
+                if (!l.listed) l.listed = true;
+                push(buildListingEditor(l));
+            });
+        } else {
+            inner.setOnClickListener(v -> showFullArt(l));
+        }
+        card.addView(inner);
+    }
+
+    /** Rounded card background; accent stroke when listed. */
+    private GradientDrawable cardBg(boolean listed) {
+        GradientDrawable g = new GradientDrawable();
+        g.setColor(Design.SURFACE);
+        g.setCornerRadius(dp(12));
+        if (listed) g.setStroke(dp(2), Design.ACCENT);
+        return g;
+    }
+
+    /** ImageView measured square (height = width) — the marketplace-grid look. */
+    private ImageView squareImage() {
+        ImageView iv = new ImageView(this) {
+            @Override protected void onMeasure(int w, int h) { super.onMeasure(w, w); }
+        };
+        iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        iv.setBackground(Design.roundBg(this, Design.SURFACE2, 10));
+        iv.setClipToOutline(true);
+        return iv;
+    }
+
+    // ==== SCREEN 2 · Listing editor ====
+
+    private View buildListingEditor(final NftListing l) {
+        final boolean piece = l.stateIdx > 0;
+        LinearLayout col = column();
+        col.setTag("editor:" + identiconKey(l));
+        col.addView(header("Price your listing", true));
+
+        ScrollView sv = new ScrollView(this);
+        LinearLayout body = new LinearLayout(this);
+        body.setOrientation(LinearLayout.VERTICAL);
+        body.setPadding(dp(16), dp(10), dp(16), dp(24));
+        sv.addView(body);
+        col.addView(sv, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        // full-width art
+        ImageView art = new ImageView(this);
+        art.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        art.setBackground(Design.roundBg(this, Design.SURFACE2, 14));
+        art.setClipToOutline(true);
+        art.setLayoutParams(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(220)));
+        art.setImageBitmap(Identicon.forToken(identiconKey(l), dp(220)));
+        String artUrl = artUrlOf(l);
+        if (!artUrl.isEmpty()) ImageLoader.loadOver(this, artUrl, art, null);
+        art.setOnClickListener(v -> showFullArt(l));
+        body.addView(art);
+
+        LinearLayout meta = new LinearLayout(this); meta.setOrientation(LinearLayout.HORIZONTAL); meta.setGravity(Gravity.CENTER_VERTICAL);
+        meta.setPadding(0, dp(10), 0, 0);
+        TextView nm = new TextView(this);
+        nm.setText(piece ? l.snMeta.name + " #" + l.stateIdx : l.bal.meta.name);
+        nm.setTextColor(Design.TEXT); nm.setTextSize(17f); nm.setTypeface(null, Typeface.BOLD);
+        nm.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        meta.addView(nm);
+        TextView ed = new TextView(this);
+        ed.setText(piece ? "Edition #" + l.stateIdx + " of " + l.snMeta.size : editionChip(l));
+        ed.setTextColor(Design.DIM); ed.setTextSize(12.5f);
+        meta.addView(ed);
+        body.addView(meta);
+
+        // ticker · tokenid · external link
+        LinearLayout prov = new LinearLayout(this); prov.setOrientation(LinearLayout.HORIZONTAL); prov.setGravity(Gravity.CENTER_VERTICAL);
+        TextView tid = new TextView(this);
+        String tkr = !piece && l.bal.meta.ticker != null && !l.bal.meta.ticker.isEmpty() ? l.bal.meta.ticker + " · " : "";
+        tid.setText(tkr + Util.shorten(l.tokenid));
+        tid.setTextColor(Design.DIM2); tid.setTextSize(11.5f);
+        tid.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        prov.addView(tid);
+        final String ext = piece ? l.snMeta.externalUrl : l.bal.meta.externalUrl;
+        if (ext != null && (ext.startsWith("http://") || ext.startsWith("https://"))) {
+            TextView link = new TextView(this); link.setText("↗"); link.setTextColor(Design.ACCENT); link.setTextSize(14f);
+            link.setPadding(dp(8), 0, 0, 0);
+            link.setOnClickListener(v -> { try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(ext))); } catch (Exception ignored) {} });
+            prov.addView(link);
+        }
+        body.addView(prov);
+
+        body.addView(sectionLabel("Name"));
+        body.addView(field(l.name, "Listing name", v -> l.name = v));
+        body.addView(sectionLabel("About"));
+        EditText desc = field(l.description, "Tell buyers about this piece (optional)", v -> l.description = v);
+        desc.setMinLines(2); body.addView(desc);
+
+        body.addView(sectionLabel("Price"));
+        LinearLayout pr = new LinearLayout(this); pr.setOrientation(LinearLayout.HORIZONTAL); pr.setGravity(Gravity.CENTER_VERTICAL);
+        EditText price = field(l.price, "0", v -> l.price = v);
+        price.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        price.setLayoutParams(new LinearLayout.LayoutParams(dp(120), ViewGroup.LayoutParams.WRAP_CONTENT));
+        pr.addView(price);
+        TextView cur = new TextView(this); cur.setText("  " + currencyLabel()); cur.setTextColor(Design.DIM); cur.setTextSize(14f);
+        pr.addView(cur);
+        body.addView(pr);
+
+        // editions stepper (only meaningful for multi-edition holdings; a piece is always unique)
+        final BigInteger held = piece ? BigInteger.ONE : wholeUnits(l.bal.sendable);
+        if (held.compareTo(BigInteger.ONE) > 0) {
+            body.addView(sectionLabel("Editions for sale"));
+            LinearLayout st = new LinearLayout(this); st.setOrientation(LinearLayout.HORIZONTAL); st.setGravity(Gravity.CENTER_VERTICAL);
+            final TextView qty = new TextView(this);
+            qty.setTextColor(Design.TEXT); qty.setTextSize(16f); qty.setGravity(Gravity.CENTER); qty.setMinWidth(dp(44));
+            final Runnable render = () -> qty.setText(clampUnits(l, held).toString());
+            TextView minus = roundBtn("–"); TextView plus = roundBtn("+");
+            minus.setOnClickListener(v -> { l.units = clampUnits(l, held).subtract(BigInteger.ONE).max(BigInteger.ONE).toString(); render.run(); });
+            plus.setOnClickListener(v -> { l.units = clampUnits(l, held).add(BigInteger.ONE).min(held).toString(); render.run(); });
+            render.run();
+            st.addView(minus); st.addView(qty); st.addView(plus);
+            TextView of = new TextView(this); of.setText("  of " + held + " you hold"); of.setTextColor(Design.DIM); of.setTextSize(13f);
+            st.addView(of);
+            body.addView(st);
+        }
+
+        TextView done = button("Done — listed", true);
+        LinearLayout.LayoutParams dl = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        dl.topMargin = dp(20); done.setLayoutParams(dl); done.setPadding(dp(16), dp(13), dp(16), dp(13));
+        done.setOnClickListener(v -> {
+            if (!priced(l)) { toast("Set a price."); return; }
+            l.listed = true;
+            pop();
+            refreshIfTag("gallery");
+            refreshIfCollection(l.tokenid);
+        });
+        body.addView(done);
+
+        TextView remove = button("Remove listing", false);
+        LinearLayout.LayoutParams rl = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        rl.topMargin = dp(8); remove.setLayoutParams(rl);
+        remove.setTextColor(Design.RED);
+        remove.setOnClickListener(v -> { l.listed = false; pop(); refreshIfTag("gallery"); refreshIfCollection(l.tokenid); });
+        body.addView(remove);
+
+        return col;
+    }
+
+    private BigInteger clampUnits(NftListing l, BigInteger held) {
+        BigInteger u = wholeUnits(l.units);
+        if (u.signum() <= 0) u = held;
+        return u.min(held).max(BigInteger.ONE);
+    }
+
+    private void showFullArt(NftListing l) {
+        ImageView iv = new ImageView(this);
+        iv.setAdjustViewBounds(true);
+        iv.setImageBitmap(Identicon.forToken(identiconKey(l), dp(320)));
+        String artUrl = artUrlOf(l);
+        if (!artUrl.isEmpty()) ImageLoader.loadFull(this, artUrl, iv, 0);
+        ScrollView sv = new ScrollView(this);
+        sv.addView(iv);
+        new AlertDialog.Builder(this).setView(sv).setPositiveButton("Close", null).show();
+    }
+
+    // ==== SCREEN 2b · Collection piece grid ====
+
+    private List<NftListing> piecesOf(StateCollection col) {
+        List<NftListing> out = new ArrayList<>();
+        for (Map.Entry<String, NftListing> e : listings.entrySet())
+            if (e.getKey().startsWith(col.tokenid + "#")) out.add(e.getValue());
+        out.sort((a, b) -> Integer.compare(a.stateIdx, b.stateIdx));
+        return out;
+    }
+
+    private View buildCollectionGrid(final StateCollection col) {
+        LinearLayout root = column();
+        root.setTag("collection:" + col.tokenid);
+        root.addView(header(col.meta.name, true));
+
+        List<NftListing> pieces = piecesOf(col);
+        int listed = 0;
+        for (NftListing l : pieces) if (l.listed) listed++;
+
+        TextView sub = new TextView(this);
+        sub.setText(pieces.size() + " of " + col.meta.size + " pieces in your wallet · " + listedItems().size() + "/" + MAX_PRODUCTS + " listed in shop");
+        sub.setTextColor(Design.DIM); sub.setTextSize(12.5f); sub.setPadding(dp(16), dp(6), dp(16), 0);
+        root.addView(sub);
+        if (col.unstampedCount > 0) root.addView(hint(col.unstampedCount + " unstamped — not listable until stamped."));
+        if (col.legacy) root.addView(hint("Legacy contract: the creator can still rewrite piece state."));
+        if (col.tooLong) root.addView(hint("This collection's coin list is too large for this node to return here."));
+
+        LinearLayout actions = new LinearLayout(this); actions.setOrientation(LinearLayout.HORIZONTAL);
+        actions.setPadding(dp(16), dp(8), dp(16), 0);
+        TextView priceAll = button("Price all owned…", false);
+        priceAll.setOnClickListener(v -> priceAllDialog(col));
+        actions.addView(priceAll);
+        root.addView(actions);
+
+        RecyclerView rv = new RecyclerView(this);
+        rv.setLayoutManager(new GridLayoutManager(this, 2));
+        rv.setPadding(dp(10), dp(4), dp(10), dp(10));
+        rv.setClipToPadding(false);
+        rv.setAdapter(new GalleryAdapter(pieces, true));
+        root.addView(rv, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        TextView back = button(listed == 0 ? "No pieces listed yet" : "Done · " + listed + " listed  →", listed > 0);
+        LinearLayout.LayoutParams bl = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        bl.setMargins(dp(16), dp(8), dp(16), dp(14)); back.setLayoutParams(bl);
+        back.setPadding(dp(16), dp(13), dp(16), dp(13));
+        back.setOnClickListener(v -> pop());
+        root.addView(back);
+        return root;
+    }
+
+    /** One price for every listable piece you hold, in edition order, up to the shop cap. */
+    private void priceAllDialog(final StateCollection col) {
+        final EditText in = new EditText(this);
+        in.setHint("Price per piece (" + currencyLabel() + ")");
+        in.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        in.setTextColor(Design.TEXT); in.setHintTextColor(Design.DIM2);
+        new AlertDialog.Builder(this)
+                .setTitle("Price all owned pieces")
+                .setView(in)
+                .setPositiveButton("List them", (d, w) -> {
+                    String p = in.getText().toString().trim();
+                    try { if (new BigDecimal(p).signum() <= 0) { toast("Set a price above 0."); return; } }
+                    catch (Exception e) { toast("Set a price above 0."); return; }
+                    int added = 0; boolean capped = false;
+                    for (NftListing l : piecesOf(col)) {
+                        if (l.listed) { l.price = p; continue; }
+                        if (listedItems().size() >= MAX_PRODUCTS) { capped = true; break; }
+                        l.listed = true; l.price = p; added++;
+                    }
+                    toast(capped ? "Listed " + added + " — shop cap is " + MAX_PRODUCTS : "Listed " + added + " pieces at " + p + " " + currencyLabel());
+                    refreshIfCollection(col.tokenid);
+                    refreshIfTag("gallery");
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    // ==== SCREEN 3 · Shop details ====
+
+    private View buildShopDetails() {
+        LinearLayout col = column();
+        col.setTag("shop");
+        col.addView(header("Your shop", true));
+
+        ScrollView sv = new ScrollView(this);
+        LinearLayout body = new LinearLayout(this);
+        body.setOrientation(LinearLayout.VERTICAL);
+        body.setPadding(dp(16), dp(10), dp(16), dp(24));
+        sv.addView(body);
+        col.addView(sv, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        body.addView(sectionLabel("Shop name"));
+        body.addView(field(shopName, "e.g. Zebra Gallery", s -> shopName = s));
+
+        body.addView(sectionLabel("About"));
+        EditText ab = field(about, "One line about your gallery (optional)", s -> about = s);
+        ab.setMinLines(2); body.addView(ab);
+
+        body.addView(sectionLabel("Pays in"));
+        LinearLayout cur = new LinearLayout(this); cur.setOrientation(LinearLayout.HORIZONTAL);
+        cur.addView(seg("Minima", currency.equals("Minima"), () -> { currency = "Minima"; tokenid = CommsTransport.MINIMA; refreshTop(buildShopDetails()); }));
+        cur.addView(seg("mxUSDT", currency.equals("USDT"), () -> { currency = "USDT"; tokenid = CommsTransport.USDT; refreshTop(buildShopDetails()); }));
+        body.addView(cur);
+
+        int n = listedItems().size();
+        TextView info = new TextView(this);
+        info.setText(n + (n == 1 ? " listing" : " listings") + " · delivery is on-chain, automatic after payment");
+        info.setTextColor(Design.DIM); info.setTextSize(12.5f); info.setPadding(0, dp(18), 0, 0);
+        body.addView(info);
+
+        TextView preview = button("Preview shop  →", true);
+        LinearLayout.LayoutParams pl = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        pl.topMargin = dp(16); preview.setLayoutParams(pl); preview.setPadding(dp(16), dp(13), dp(16), dp(13));
+        preview.setOnClickListener(v -> {
+            if (shopName.trim().isEmpty()) { toast("Give your shop a name."); return; }
+            push(buildPreview());
+        });
+        body.addView(preview);
+
+        return col;
+    }
+
+    // ==== SCREEN 4 · Preview (buyer's view) + export ====
+
+    private View buildPreview() {
+        LinearLayout col = column();
+        col.setTag("preview");
+        col.addView(header("Preview — buyer's view", true));
+
+        // collection header, exactly the miniMall treatment
+        LinearLayout ch = new LinearLayout(this); ch.setOrientation(LinearLayout.VERTICAL);
+        ch.setPadding(dp(16), dp(10), dp(16), dp(4));
+        TextView sn = new TextView(this); sn.setText(shopName.trim());
+        sn.setTextColor(Design.TEXT); sn.setTextSize(19f); sn.setTypeface(null, Typeface.BOLD);
+        ch.addView(sn);
+        TextView sub = new TextView(this); sub.setText("NFT SHOP · pays in " + currencyLabel());
+        sub.setTextColor(Design.ACCENT); sub.setTextSize(11.5f); sub.setTypeface(null, Typeface.BOLD);
+        sub.setPadding(0, dp(2), 0, 0);
+        ch.addView(sub);
+        if (!about.trim().isEmpty()) {
+            TextView abt = new TextView(this); abt.setText(about.trim());
+            abt.setTextColor(Design.DIM); abt.setTextSize(13f); abt.setPadding(0, dp(4), 0, 0);
+            ch.addView(abt);
+        }
+        col.addView(ch);
+
+        RecyclerView rv = new RecyclerView(this);
+        rv.setLayoutManager(new GridLayoutManager(this, 2));
+        rv.setPadding(dp(10), dp(4), dp(10), dp(10));
+        rv.setClipToPadding(false);
+        rv.setAdapter(new GalleryAdapter(listedItems(), false));
+        col.addView(rv, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        TextView export = button(exporting ? "Preparing images…" : "Export & share .shop", true);
+        LinearLayout.LayoutParams el = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        el.setMargins(dp(16), dp(8), dp(16), dp(14)); export.setLayoutParams(el);
+        export.setPadding(dp(16), dp(13), dp(16), dp(13));
+        export.setOnClickListener(v -> exportShop());
+        col.addView(export);
+
+        return col;
+    }
+
+    // ---- export (.shop schema v2) ----
+
     private void exportShop() {
         if (exporting) return;
         if (shopName.trim().isEmpty()) { toast("Give your shop a name."); return; }
         if (!cardReady()) { toast("Connect your node so the shop key can be set."); return; }
-        final java.util.List<NftListing> sel = new java.util.ArrayList<>();
-        for (NftListing l : listings.values()) if (l.selected) sel.add(l);
-        if (sel.isEmpty()) { toast("Tick at least one NFT to sell."); return; }
+        final List<NftListing> sel = listedItems();
+        if (sel.isEmpty()) { toast("List at least one NFT."); return; }
         for (NftListing l : sel) {
-            String nm = l.name.trim().isEmpty() ? l.bal.meta.name : l.name.trim();
-            try {
-                if (new BigDecimal(l.price.trim()).signum() <= 0) { toast("Set a price for " + nm + "."); return; }
-            } catch (Exception e) { toast("Set a price for " + nm + "."); return; }
+            if (!priced(l)) { toast("Set a price for " + displayName(l) + "."); return; }
+            // A piece must still be in the wallet, stamped and cleanly replayable at export time.
+            if (l.stateIdx > 0 && (l.coinRaw == null || StateNft.stamped(l.coinRaw) == null || !StateNft.replayableState(l.coinRaw))) {
+                toast(displayName(l) + " is no longer sellable — refresh the gallery."); return;
+            }
         }
         exporting = true;
-        rebuildForm();
+        refreshTop(buildPreview());
         io.execute(() -> {
             try {
                 JSONObject o = new JSONObject();
+                o.put("schema", 3);
+                o.put("shopType", "nft");
                 o.put("shopName", shopName.trim()); o.put("shopId", slug(shopName));
+                if (!about.trim().isEmpty()) o.put("about", about.trim());
                 o.put("vendorPublicId", vendorPublicId); o.put("vendorAddress", vendorAddress);
                 o.put("currency", currency); o.put("tokenid", tokenid);
+                // compat shipping row: older miniMall builds need one; new builds hide it for NFT shops
                 JSONArray sh = new JSONArray();
-                for (Catalog.Shipping s : shipping) { JSONObject so = new JSONObject(); so.put("id", s.id); so.put("label", s.label); so.put("fee", s.fee == null || s.fee.isEmpty() ? "0" : s.fee); sh.put(so); }
+                JSONObject so = new JSONObject();
+                so.put("id", "digital"); so.put("label", "Digital / on-chain delivery"); so.put("fee", "0");
+                sh.put(so);
                 o.put("shipping", sh);
                 JSONArray ps = new JSONArray();
                 int i = 0;
                 for (NftListing l : sel) {
                     if (l.cachedB64.isEmpty()) l.cachedB64 = resolveImageB64(l);
-                    BigInteger held = wholeUnits(l.bal.sendable);
-                    BigInteger units = wholeUnits(l.units);
-                    if (units.signum() <= 0) units = BigInteger.ONE;
-                    if (units.compareTo(held) > 0) units = held;      // never offer more than we can send
                     JSONObject po = new JSONObject();
                     po.put("id", "p" + (i++));
-                    po.put("name", l.name.trim().isEmpty() ? l.bal.meta.name : l.name.trim());
+                    po.put("name", displayName(l));
                     po.put("description", l.description == null ? "" : l.description.trim());
                     po.put("mode", "units"); po.put("price", l.price.trim());
-                    po.put("maxUnits", units.intValue());
                     po.put("image", l.cachedB64);
-                    po.put("nftTokenId", l.bal.tokenid);
+                    po.put("nftTokenId", l.tokenid);
+                    if (l.stateIdx > 0) {
+                        // StateNFT piece: unique, identified on-chain by state port 0
+                        po.put("maxUnits", 1);
+                        po.put("nftStateIdx", l.stateIdx);
+                        po.put("nftCollection", l.snMeta.name);
+                        po.put("nftSupply", l.snMeta.size);
+                        String pExt = l.snMeta.externalUrl;
+                        if (pExt != null && (pExt.startsWith("http://") || pExt.startsWith("https://"))) po.put("nftExternalUrl", pExt);
+                    } else {
+                        BigInteger held = wholeUnits(l.bal.sendable);
+                        po.put("maxUnits", clampUnits(l, held).intValue());
+                        po.put("nftSupply", wholeUnits(l.bal.total).intValue());
+                        String tkr = l.bal.meta.ticker;
+                        if (tkr != null && !tkr.isEmpty()) po.put("nftTicker", tkr);
+                        String ext = l.bal.meta.externalUrl;
+                        if (ext != null && (ext.startsWith("http://") || ext.startsWith("https://"))) po.put("nftExternalUrl", ext);
+                    }
                     ps.put(po);
                 }
                 o.put("products", ps);
@@ -389,40 +969,55 @@ public class MainActivity extends AppCompatActivity {
                 Uri uri = FileProvider.getUriForFile(this, getPackageName() + ".fileprovider", f);
                 ui.post(() -> {
                     exporting = false;
-                    rebuildForm();
+                    refreshTop(buildPreview());
                     Intent send = new Intent(Intent.ACTION_SEND);
                     send.setType("application/octet-stream");
                     send.putExtra(Intent.EXTRA_STREAM, uri);
-                    send.putExtra(Intent.EXTRA_SUBJECT, shopName.trim() + " — miniMerch NFT shop");
+                    send.putExtra(Intent.EXTRA_SUBJECT, shopName.trim() + " — NFT shop");
                     send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
                     startActivity(Intent.createChooser(send, "Share your shop"));
                 });
             } catch (Exception e) {
-                ui.post(() -> { exporting = false; rebuildForm(); toast("Export failed: " + e.getMessage()); });
+                ui.post(() -> { exporting = false; refreshTop(buildPreview()); toast("Export failed: " + e.getMessage()); });
             }
         });
     }
 
-    /** Token icon → bare base64 JPEG for the .shop image field (identicon when absent/unfetchable).
-     *  Runs on the io executor: may hit the network for http(s)/ipfs icon urls. */
+    /** The listing's art → bare base64 JPEG for the .shop image field (identicon when unfetchable).
+     *  StateNFT pieces use their state-embedded art (SVG rasterizes via androidsvg); plain NFTs the
+     *  token icon. Runs on the io executor: url-mode/http icons may hit the network. */
     private String resolveImageB64(NftListing l) {
         Bitmap bmp = null;
-        if (l.bal.hasIcon()) bmp = ImageLoader.decodeSync(l.bal.meta.iconUrl, 900);
-        if (bmp == null) bmp = Identicon.forToken(l.bal.tokenid, 512);
-        byte[] jpeg = Images.compressToFit(bmp, 90000);   // ~90KB, same budget as miniMerch Studio photos
+        String artUrl = artUrlOf(l);
+        if (!artUrl.isEmpty()) bmp = ImageLoader.decodeSync(artUrl, 900);
+        if (bmp == null) bmp = Identicon.forToken(identiconKey(l), 512);
+        byte[] jpeg = Images.compressToFit(bmp, 90000);   // ~90KB, same budget as miniMall Studio photos
         if (jpeg == null) return "";
         return android.util.Base64.encodeToString(jpeg, android.util.Base64.NO_WRAP);
     }
 
     // ---- helpers ----
+
     private static String slug(String s) {
         String r = (s == null ? "shop" : s).replaceAll("[^a-zA-Z0-9]+", "-").replaceAll("^-+|-+$", "");
         return r.isEmpty() ? "shop" : r;
     }
     private int dp(int v) { return Design.dp(this, v); }
-    private LinearLayout header(String title) {
+    private LinearLayout column() {
+        LinearLayout c = new LinearLayout(this);
+        c.setOrientation(LinearLayout.VERTICAL);
+        c.setLayoutParams(new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        return c;
+    }
+    private LinearLayout header(String title, boolean back) {
         LinearLayout h = new LinearLayout(this); h.setOrientation(LinearLayout.HORIZONTAL); h.setGravity(Gravity.CENTER_VERTICAL);
         h.setBackgroundColor(Design.SURFACE); h.setPadding(dp(16), dp(12), dp(16), dp(12));
+        if (back) {
+            TextView bk = new TextView(this); bk.setText("‹"); bk.setTextColor(Design.TEXT); bk.setTextSize(22f);
+            bk.setPadding(0, 0, dp(14), 0);
+            bk.setOnClickListener(v -> pop());
+            h.addView(bk);
+        }
         TextView t = new TextView(this); t.setText(title); t.setTextColor(Design.TEXT); t.setTextSize(18f); t.setTypeface(null, Typeface.BOLD);
         h.addView(t); return h;
     }
@@ -431,10 +1026,14 @@ public class MainActivity extends AppCompatActivity {
         t.setTypeface(null, Typeface.BOLD); t.setPadding(0, dp(16), 0, dp(6)); return t;
     }
     private TextView hint(String s) {
-        TextView t = new TextView(this); t.setText(s); t.setTextColor(Design.DIM); t.setTextSize(12f);
-        t.setPadding(0, 0, 0, dp(4)); return t;
+        TextView t = new TextView(this); t.setText(s); t.setTextColor(Design.DIM); t.setTextSize(12.5f);
+        t.setPadding(dp(16), 0, dp(16), dp(4)); return t;
     }
-    private TextView tag(String s) { TextView t = new TextView(this); t.setText(s); t.setTextColor(Design.DIM); t.setTextSize(13f); return t; }
+    private View spacerWeight() {
+        View v = new View(this);
+        v.setLayoutParams(new LinearLayout.LayoutParams(1, 0, 1f));
+        return v;
+    }
     private EditText field(String value, String hintText, java.util.function.Consumer<String> onChange) {
         EditText e = new EditText(this); e.setText(value == null ? "" : value); e.setHint(hintText); e.setHintTextColor(Design.DIM2);
         e.setTextColor(Design.TEXT); e.setTextSize(14f); e.setBackground(Design.roundBg(this, Design.SURFACE2, 10));
@@ -447,7 +1046,6 @@ public class MainActivity extends AppCompatActivity {
         });
         return e;
     }
-    private LinearLayout.LayoutParams smLp() { LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(80), ViewGroup.LayoutParams.WRAP_CONTENT); lp.leftMargin = dp(6); lp.rightMargin = dp(6); return lp; }
     private TextView seg(String text, boolean on, Runnable onClick) {
         TextView b = new TextView(this); b.setText(text); b.setGravity(Gravity.CENTER); b.setTextSize(14f);
         b.setTextColor(on ? Design.ON_ACCENT : Design.DIM); b.setBackground(Design.roundBg(this, on ? Design.ACCENT : Design.SURFACE2, 10));
@@ -459,6 +1057,13 @@ public class MainActivity extends AppCompatActivity {
         TextView b = new TextView(this); b.setText(text); b.setTextSize(14f); b.setGravity(Gravity.CENTER);
         b.setTextColor(active ? Design.ON_ACCENT : Design.TEXT); b.setBackground(Design.roundBg(this, active ? Design.ACCENT : Design.SURFACE2, 10));
         b.setPadding(dp(16), dp(11), dp(16), dp(11)); return b;
+    }
+    private TextView roundBtn(String s) {
+        TextView b = new TextView(this); b.setText(s); b.setGravity(Gravity.CENTER); b.setTextSize(18f);
+        b.setTextColor(Design.TEXT); b.setBackground(Design.roundBg(this, Design.SURFACE2, 8));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(38), dp(38));
+        lp.rightMargin = dp(4); lp.leftMargin = dp(4); b.setLayoutParams(lp);
+        return b;
     }
     private void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_SHORT).show(); }
 }
