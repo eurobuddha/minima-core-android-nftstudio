@@ -1,8 +1,8 @@
 {
   "app/build.gradle": {
-    "mtime": 1785840077.747757,
-    "ast_hash": "7481ceb8ecff436f0a25ebed8b5b615f",
-    "semantic_hash": "7481ceb8ecff436f0a25ebed8b5b615f"
+    "mtime": 1786273883.7715137,
+    "ast_hash": "f6189d5f1cd95583947945d0b6d0fe30",
+    "semantic_hash": ""
   },
   "app/src/main/java/com/eurobuddha/comms/Avatars.java": {
     "mtime": 1783342241.0,
@@ -70,9 +70,9 @@
     "semantic_hash": "2415ec747cf5321bf22e6d004b2ea681"
   },
   "app/src/main/java/com/eurobuddha/comms/NodeApi.java": {
-    "mtime": 1783342241.0,
-    "ast_hash": "6c73906c4898ce5174645442c5cb44df",
-    "semantic_hash": "6c73906c4898ce5174645442c5cb44df"
+    "mtime": 1786003509.2052522,
+    "ast_hash": "58ae4f6896fb677fd4b70b1f8953f257",
+    "semantic_hash": ""
   },
   "app/src/main/java/com/eurobuddha/comms/Opened.java": {
     "mtime": 1783342241.0,
@@ -115,9 +115,9 @@
     "semantic_hash": "99950ee5cb906c20cf20524d9f2d54a2"
   },
   "app/src/main/java/com/eurobuddha/merchnftstudio/MainActivity.java": {
-    "mtime": 1785840608.1551778,
-    "ast_hash": "ca31ad4f218f8e709926b5f240131118",
-    "semantic_hash": "ca31ad4f218f8e709926b5f240131118"
+    "mtime": 1786004090.7870822,
+    "ast_hash": "44496d5164cc85a04dadd70967e58116",
+    "semantic_hash": ""
   },
   "app/src/main/java/com/eurobuddha/merchnftstudio/TokenBalance.java": {
     "mtime": 1785840158.5247304,
@@ -130,9 +130,9 @@
     "semantic_hash": "1ca69c6bee174b4b95d3954716ca7cf8"
   },
   "app/src/main/java/com/eurobuddha/merchnftstudio/Util.java": {
-    "mtime": 1785840052.3685796,
-    "ast_hash": "64013d4174732d5704cd9f54f6943501",
-    "semantic_hash": "64013d4174732d5704cd9f54f6943501"
+    "mtime": 1786003387.2030542,
+    "ast_hash": "751776246f048879665a8538d29476e6",
+    "semantic_hash": ""
   },
   "build.gradle": {
     "mtime": 1782570412.0,
@@ -148,5 +148,40 @@
     "mtime": 1785840086.3527322,
     "ast_hash": "61cbc9c263b7fe0caa931b13204693cc",
     "semantic_hash": "61cbc9c263b7fe0caa931b13204693cc"
+  },
+  "app/src/main/java/com/eurobuddha/merchnftstudio/StateNft.java": {
+    "mtime": 1786003260.206352,
+    "ast_hash": "622652ba762f3b5fe9abc68c68c84c9c",
+    "semantic_hash": ""
+  },
+  "README.md": {
+    "mtime": 1785840136.6728823,
+    "ast_hash": "9e77730e4e5b0602acde2c7d9e972ae4",
+    "semantic_hash": ""
+  },
+  "app/src/main/res/mipmap-hdpi/ic_launcher_foreground.png": {
+    "mtime": 1782571892.0,
+    "ast_hash": "2a913fadbc1c977498ee29d9f71805fc",
+    "semantic_hash": ""
+  },
+  "app/src/main/res/mipmap-mdpi/ic_launcher_foreground.png": {
+    "mtime": 1782571892.0,
+    "ast_hash": "e74aa2aeb1e62ca0ba79a76251aeb223",
+    "semantic_hash": ""
+  },
+  "app/src/main/res/mipmap-xhdpi/ic_launcher_foreground.png": {
+    "mtime": 1782571892.0,
+    "ast_hash": "f507945585274d88ea05517f412e8589",
+    "semantic_hash": ""
+  },
+  "app/src/main/res/mipmap-xxhdpi/ic_launcher_foreground.png": {
+    "mtime": 1782571892.0,
+    "ast_hash": "7b74ce77941fb7bf1d5b95b4f796f3a1",
+    "semantic_hash": ""
+  },
+  "app/src/main/res/mipmap-xxxhdpi/ic_launcher_foreground.png": {
+    "mtime": 1782571892.0,
+    "ast_hash": "2557ed329bac345981b1b0fb4ff4667d",
+    "semantic_hash": ""
   }
 }

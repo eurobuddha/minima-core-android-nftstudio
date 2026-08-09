@@ -90,11 +90,13 @@ public class MainActivity extends AppCompatActivity {
     private FrameLayout container;
 
     /** A wallet NFT with the vendor's listing edits layered on top of the token metadata.
-     *  Plain NFT: bal set, stateIdx 0. StateNFT piece: stateIdx ≥ 1, coinRaw + snMeta set, bal null. */
+     *  Plain NFT: bal set, stateIdx 0. StateNFT piece: stateIdx ≥ 1, coinRaw + snMeta set, bal null.
+     *  Complete-collection bundle: bundle=true, snMeta set — sells every piece the vendor holds. */
     private static final class NftListing {
         String tokenid = "";
         TokenBalance bal;
         int stateIdx = 0;                     // ≥1 = a piece of a StateNFT collection
+        boolean bundle = false;               // the whole collection as ONE listing
         JSONObject coinRaw;                   // the piece's raw coin (byte-exact state)
         StateNft.Meta snMeta;                 // the piece's collection metadata
         boolean listed = false;
@@ -308,6 +310,7 @@ public class MainActivity extends AppCompatActivity {
                 if (arr != null) for (int i = 0; i < arr.length(); i++) {
                     JSONObject c = arr.optJSONObject(i);
                     if (c == null || !Util.isValidHexId(c.optString("coinid", ""))) continue;
+                    if (StateNft.isBuried(c)) continue;                           // graveyard coins still get tracked
                     String idx = StateNft.stamped(c);
                     if (idx == null) { col.unstampedCount++; continue; }          // sentinel — not listable
                     if (!idx.matches("^[0-9]+$") || !StateNft.replayableState(c)) continue;  // hostile state
@@ -363,11 +366,16 @@ public class MainActivity extends AppCompatActivity {
     private String displayName(NftListing l) {
         String n = l.name == null ? "" : l.name.trim();
         if (!n.isEmpty()) return n;
+        if (l.bundle) return l.snMeta.name + " — complete collection";
         if (l.stateIdx > 0) return l.snMeta.name + " #" + l.stateIdx;
         return l.bal == null || l.bal.meta.name == null ? "NFT" : l.bal.meta.name;
     }
 
     private String editionChip(NftListing l) {
+        if (l.bundle) {
+            StateCollection col = collections.get(l.tokenid);
+            return "◈ all " + (col == null ? "" : col.ownedCoins.size() + " ") + "pieces";
+        }
         if (l.stateIdx > 0) return "◈ #" + l.stateIdx + " / " + l.snMeta.size;
         BigInteger supply = wholeUnits(l.bal.total);
         return BigInteger.ONE.equals(supply) ? "◈ 1 of 1" : "◈ ×" + supply + " eds";
@@ -380,11 +388,13 @@ public class MainActivity extends AppCompatActivity {
 
     /** Art source for any listing/collection card; empty string = identicon only. */
     private String artUrlOf(NftListing l) {
+        if (l.bundle) { String u = IconResolver.resolve(l.snMeta.icon); return u == null ? "" : u; }
         if (l.stateIdx > 0) { String u = pieceImageUrl(l); return u == null ? "" : u; }
         return l.bal != null && l.bal.hasIcon() ? l.bal.meta.iconUrl : "";
     }
 
     private String identiconKey(NftListing l) {
+        if (l.bundle) return l.tokenid + "#ALL";
         return l.stateIdx > 0 ? l.tokenid + "#" + l.stateIdx : l.tokenid;
     }
 
@@ -480,8 +490,13 @@ public class MainActivity extends AppCompatActivity {
         LinearLayout inner = new LinearLayout(this);
         inner.setOrientation(LinearLayout.VERTICAL);
         int listed = 0;
-        for (NftListing l : listings.values()) if (l.listed && l.stateIdx > 0 && col.tokenid.equals(l.tokenid)) listed++;
-        inner.setBackground(cardBg(listed > 0));
+        boolean bundled = false;
+        for (NftListing l : listings.values()) {
+            if (!l.listed || !col.tokenid.equals(l.tokenid)) continue;
+            if (l.bundle) bundled = true;
+            else if (l.stateIdx > 0) listed++;
+        }
+        inner.setBackground(cardBg(listed > 0 || bundled));
         inner.setPadding(dp(6), dp(6), dp(6), dp(10));
         LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         ilp.setMargins(dp(6), dp(6), dp(6), dp(6));
@@ -505,9 +520,10 @@ public class MainActivity extends AppCompatActivity {
         inner.addView(ed);
 
         TextView pr = new TextView(this);
-        pr.setText(col.coinsLoading && !col.coinsLoaded ? "reading pieces…" : (listed > 0 ? listed + " listed" : "tap to view pieces"));
-        pr.setTextColor(listed > 0 ? Design.ACCENT : Design.DIM2);
-        if (listed > 0) pr.setTypeface(null, Typeface.BOLD);
+        pr.setText(col.coinsLoading && !col.coinsLoaded ? "reading pieces…"
+                : (bundled ? "complete collection listed" : (listed > 0 ? listed + " listed" : "tap to view pieces")));
+        pr.setTextColor(listed > 0 || bundled ? Design.ACCENT : Design.DIM2);
+        if (listed > 0 || bundled) pr.setTypeface(null, Typeface.BOLD);
         pr.setTextSize(13f); pr.setPadding(dp(4), dp(2), dp(4), 0);
         inner.addView(pr);
 
@@ -577,7 +593,11 @@ public class MainActivity extends AppCompatActivity {
         if (galleryMode) {
             inner.setOnClickListener(v -> {
                 if (!l.listed && listedItems().size() >= MAX_PRODUCTS) { toast("A shop holds at most " + MAX_PRODUCTS + " listings."); return; }
-                if (!l.listed) l.listed = true;
+                if (!l.listed) {
+                    // listing an individual piece supersedes a complete-collection listing
+                    if (l.stateIdx > 0) { StateCollection c = collections.get(l.tokenid); if (c != null) unlistBundle(c); }
+                    l.listed = true;
+                }
                 push(buildListingEditor(l));
             });
         } else {
@@ -741,10 +761,12 @@ public class MainActivity extends AppCompatActivity {
     private List<NftListing> piecesOf(StateCollection col) {
         List<NftListing> out = new ArrayList<>();
         for (Map.Entry<String, NftListing> e : listings.entrySet())
-            if (e.getKey().startsWith(col.tokenid + "#")) out.add(e.getValue());
+            if (e.getKey().startsWith(col.tokenid + "#") && e.getValue().stateIdx > 0) out.add(e.getValue());
         out.sort((a, b) -> Integer.compare(a.stateIdx, b.stateIdx));
         return out;
     }
+
+    private NftListing bundleOf(StateCollection col) { return listings.get(col.tokenid + "#ALL"); }
 
     private View buildCollectionGrid(final StateCollection col) {
         LinearLayout root = column();
@@ -752,22 +774,51 @@ public class MainActivity extends AppCompatActivity {
         root.addView(header(col.meta.name, true));
 
         List<NftListing> pieces = piecesOf(col);
+        NftListing bundle = bundleOf(col);
         int listed = 0;
         for (NftListing l : pieces) if (l.listed) listed++;
+        boolean bundleListed = bundle != null && bundle.listed;
 
+        // Collection identity row: the standard top-side token icon next to the stats — the pieces
+        // below carry their own stamped artwork.
+        LinearLayout idRow = new LinearLayout(this); idRow.setOrientation(LinearLayout.HORIZONTAL); idRow.setGravity(Gravity.CENTER_VERTICAL);
+        idRow.setPadding(dp(16), dp(8), dp(16), 0);
+        ImageView icon = new ImageView(this);
+        icon.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        icon.setBackground(Design.roundBg(this, Design.SURFACE2, 10)); icon.setClipToOutline(true);
+        LinearLayout.LayoutParams il = new LinearLayout.LayoutParams(dp(54), dp(54)); il.rightMargin = dp(10); icon.setLayoutParams(il);
+        icon.setImageBitmap(Identicon.forToken(col.tokenid, dp(54)));
+        String iconUrl = IconResolver.resolve(col.meta.icon);
+        if (iconUrl != null && !iconUrl.isEmpty()) ImageLoader.loadOver(this, iconUrl, icon, null);
+        idRow.addView(icon);
+        LinearLayout stats = new LinearLayout(this); stats.setOrientation(LinearLayout.VERTICAL);
         TextView sub = new TextView(this);
-        sub.setText(pieces.size() + " of " + col.meta.size + " pieces in your wallet · " + listedItems().size() + "/" + MAX_PRODUCTS + " listed in shop");
-        sub.setTextColor(Design.DIM); sub.setTextSize(12.5f); sub.setPadding(dp(16), dp(6), dp(16), 0);
-        root.addView(sub);
+        sub.setText(pieces.size() + " of " + col.meta.size + " pieces in your wallet");
+        sub.setTextColor(Design.TEXT); sub.setTextSize(13f);
+        stats.addView(sub);
+        TextView sub2 = new TextView(this);
+        sub2.setText(bundleListed ? "complete collection listed · " + Util.tidyAmount(bundle.price) + " " + currencyLabel()
+                : listed + " pieces listed · " + listedItems().size() + "/" + MAX_PRODUCTS + " shop slots");
+        sub2.setTextColor(bundleListed || listed > 0 ? Design.ACCENT : Design.DIM); sub2.setTextSize(12f);
+        stats.addView(sub2);
+        idRow.addView(stats);
+        root.addView(idRow);
+
         if (col.unstampedCount > 0) root.addView(hint(col.unstampedCount + " unstamped — not listable until stamped."));
         if (col.legacy) root.addView(hint("Legacy contract: the creator can still rewrite piece state."));
         if (col.tooLong) root.addView(hint("This collection's coin list is too large for this node to return here."));
 
         LinearLayout actions = new LinearLayout(this); actions.setOrientation(LinearLayout.HORIZONTAL);
         actions.setPadding(dp(16), dp(8), dp(16), 0);
-        TextView priceAll = button("Price all owned…", false);
+        TextView priceAll = button("Price each…", false);
         priceAll.setOnClickListener(v -> priceAllDialog(col));
+        LinearLayout.LayoutParams palp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        palp.rightMargin = dp(8); priceAll.setLayoutParams(palp);
         actions.addView(priceAll);
+        TextView sellAll = button(bundleListed ? "Complete collection · edit" : "Sell complete collection…", bundleListed);
+        sellAll.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        sellAll.setOnClickListener(v -> bundleDialog(col));
+        actions.addView(sellAll);
         root.addView(actions);
 
         RecyclerView rv = new RecyclerView(this);
@@ -777,7 +828,8 @@ public class MainActivity extends AppCompatActivity {
         rv.setAdapter(new GalleryAdapter(pieces, true));
         root.addView(rv, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
 
-        TextView back = button(listed == 0 ? "No pieces listed yet" : "Done · " + listed + " listed  →", listed > 0);
+        int totalListed = listed + (bundleListed ? 1 : 0);
+        TextView back = button(totalListed == 0 ? "Nothing listed yet" : "Done · " + (bundleListed ? "complete collection listed" : listed + " listed") + "  →", totalListed > 0);
         LinearLayout.LayoutParams bl = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         bl.setMargins(dp(16), dp(8), dp(16), dp(14)); back.setLayoutParams(bl);
         back.setPadding(dp(16), dp(13), dp(16), dp(13));
@@ -786,19 +838,21 @@ public class MainActivity extends AppCompatActivity {
         return root;
     }
 
-    /** One price for every listable piece you hold, in edition order, up to the shop cap. */
+    /** One price for every listable piece you hold, in edition order, up to the shop cap.
+     *  Mutually exclusive with the complete-collection bundle (double-selling guard). */
     private void priceAllDialog(final StateCollection col) {
         final EditText in = new EditText(this);
         in.setHint("Price per piece (" + currencyLabel() + ")");
         in.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
         in.setTextColor(Design.TEXT); in.setHintTextColor(Design.DIM2);
         new AlertDialog.Builder(this)
-                .setTitle("Price all owned pieces")
+                .setTitle("Price each owned piece")
                 .setView(in)
                 .setPositiveButton("List them", (d, w) -> {
                     String p = in.getText().toString().trim();
                     try { if (new BigDecimal(p).signum() <= 0) { toast("Set a price above 0."); return; } }
                     catch (Exception e) { toast("Set a price above 0."); return; }
+                    unlistBundle(col);
                     int added = 0; boolean capped = false;
                     for (NftListing l : piecesOf(col)) {
                         if (l.listed) { l.price = p; continue; }
@@ -811,6 +865,60 @@ public class MainActivity extends AppCompatActivity {
                 })
                 .setNegativeButton("Cancel", null)
                 .show();
+    }
+
+    private void unlistBundle(StateCollection col) {
+        NftListing b = bundleOf(col);
+        if (b != null && b.listed) { b.listed = false; toast("Complete-collection listing removed."); }
+    }
+    private void unlistPieces(StateCollection col) {
+        int n = 0;
+        for (NftListing l : piecesOf(col)) if (l.listed) { l.listed = false; n++; }
+        if (n > 0) toast(n + " piece listing" + (n == 1 ? "" : "s") + " removed.");
+    }
+
+    /** Sell every piece you hold as ONE product. The Inbox delivers them piece by piece — each is
+     *  its own on-chain transaction. Mutually exclusive with per-piece listings. */
+    private void bundleDialog(final StateCollection col) {
+        if (col.ownedCoins.isEmpty()) { toast("You hold no listable pieces of this collection."); return; }
+        NftListing existing = bundleOf(col);
+        final EditText in = new EditText(this);
+        in.setHint("Price for all " + col.ownedCoins.size() + " pieces (" + currencyLabel() + ")");
+        if (existing != null && !existing.price.isEmpty()) in.setText(existing.price);
+        in.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        in.setTextColor(Design.TEXT); in.setHintTextColor(Design.DIM2);
+        AlertDialog.Builder b = new AlertDialog.Builder(this)
+                .setTitle("Sell the complete collection")
+                .setMessage("One listing for every piece you hold (" + col.ownedCoins.size() + "). The buyer receives them one by one — each piece is its own on-chain transfer.")
+                .setView(in)
+                .setPositiveButton(existing != null && existing.listed ? "Update price" : "List it", (d, w) -> {
+                    String p = in.getText().toString().trim();
+                    try { if (new BigDecimal(p).signum() <= 0) { toast("Set a price above 0."); return; } }
+                    catch (Exception e) { toast("Set a price above 0."); return; }
+                    unlistPieces(col);
+                    NftListing l = listings.get(col.tokenid + "#ALL");
+                    if (l == null) {
+                        if (listedItems().size() >= MAX_PRODUCTS) { toast("Shop is full (" + MAX_PRODUCTS + ")."); return; }
+                        l = new NftListing();
+                        l.name = col.meta.name + " — complete collection";
+                        l.description = "Every piece the seller holds, delivered to your wallet one by one.";
+                        l.units = "1";
+                        listings.put(col.tokenid + "#ALL", l);
+                    }
+                    l.tokenid = col.tokenid; l.bundle = true; l.snMeta = col.meta;
+                    l.listed = true; l.price = p;
+                    refreshIfCollection(col.tokenid);
+                    refreshIfTag("gallery");
+                })
+                .setNegativeButton("Cancel", null);
+        if (existing != null && existing.listed) {
+            b.setNeutralButton("Unlist", (d, w) -> {
+                unlistBundle(col);
+                refreshIfCollection(col.tokenid);
+                refreshIfTag("gallery");
+            });
+        }
+        b.show();
     }
 
     // ==== SCREEN 3 · Shop details ====
@@ -913,6 +1021,10 @@ public class MainActivity extends AppCompatActivity {
             if (l.stateIdx > 0 && (l.coinRaw == null || StateNft.stamped(l.coinRaw) == null || !StateNft.replayableState(l.coinRaw))) {
                 toast(displayName(l) + " is no longer sellable — refresh the gallery."); return;
             }
+            if (l.bundle) {
+                StateCollection c = collections.get(l.tokenid);
+                if (c == null || c.ownedCoins.isEmpty()) { toast(displayName(l) + " has no pieces left — refresh the gallery."); return; }
+            }
         }
         exporting = true;
         refreshTop(buildPreview());
@@ -942,7 +1054,17 @@ public class MainActivity extends AppCompatActivity {
                     po.put("mode", "units"); po.put("price", l.price.trim());
                     po.put("image", l.cachedB64);
                     po.put("nftTokenId", l.tokenid);
-                    if (l.stateIdx > 0) {
+                    if (l.bundle) {
+                        // Complete collection: every piece the seller holds, delivered one by one
+                        StateCollection c = collections.get(l.tokenid);
+                        po.put("maxUnits", 1);
+                        po.put("nftBundle", 1);
+                        po.put("nftPieces", c == null ? 0 : c.ownedCoins.size());
+                        po.put("nftCollection", l.snMeta.name);
+                        po.put("nftSupply", l.snMeta.size);
+                        String bExt = l.snMeta.externalUrl;
+                        if (bExt != null && (bExt.startsWith("http://") || bExt.startsWith("https://"))) po.put("nftExternalUrl", bExt);
+                    } else if (l.stateIdx > 0) {
                         // StateNFT piece: unique, identified on-chain by state port 0
                         po.put("maxUnits", 1);
                         po.put("nftStateIdx", l.stateIdx);
@@ -963,6 +1085,26 @@ public class MainActivity extends AppCompatActivity {
                 }
                 o.put("products", ps);
 
+                // Collection directory: name/size/top-side icon per referenced collection, so the
+                // buyer app can show the standard token icon alongside the stamped piece art.
+                java.util.LinkedHashSet<String> colIds = new java.util.LinkedHashSet<>();
+                for (NftListing l : sel) if (l.snMeta != null && (l.stateIdx > 0 || l.bundle)) colIds.add(l.tokenid);
+                if (!colIds.isEmpty()) {
+                    JSONArray cols = new JSONArray();
+                    for (String tid : colIds) {
+                        StateCollection c = collections.get(tid);
+                        if (c == null) continue;
+                        JSONObject co = new JSONObject();
+                        co.put("tokenid", tid);
+                        co.put("name", c.meta.name);
+                        co.put("size", c.meta.size);
+                        String iconB64 = resolveIconB64(c);
+                        if (!iconB64.isEmpty()) co.put("icon", iconB64);
+                        cols.put(co);
+                    }
+                    o.put("nftCollections", cols);
+                }
+
                 File dir = new File(getCacheDir(), "shops"); dir.mkdirs();
                 File f = new File(dir, slug(shopName) + ".shop");
                 try (FileWriter w = new FileWriter(f)) { w.write(o.toString()); }
@@ -981,6 +1123,16 @@ public class MainActivity extends AppCompatActivity {
                 ui.post(() -> { exporting = false; refreshTop(buildPreview()); toast("Export failed: " + e.getMessage()); });
             }
         });
+    }
+
+    /** The collection's top-side token icon → small bare base64 JPEG (identicon fallback). */
+    private String resolveIconB64(StateCollection col) {
+        Bitmap bmp = null;
+        String iconUrl = IconResolver.resolve(col.meta.icon);
+        if (iconUrl != null && !iconUrl.isEmpty()) bmp = ImageLoader.decodeSync(iconUrl, 320);
+        if (bmp == null) bmp = Identicon.forToken(col.tokenid, 256);
+        byte[] jpeg = Images.compressToFit(bmp, 24000);
+        return jpeg == null ? "" : android.util.Base64.encodeToString(jpeg, android.util.Base64.NO_WRAP);
     }
 
     /** The listing's art → bare base64 JPEG for the .shop image field (identicon when unfetchable).

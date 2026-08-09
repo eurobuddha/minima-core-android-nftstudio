@@ -1,0 +1,23 @@
+{
+  "0": "MainActivity",
+  "1": "CommsIdentity",
+  "2": "CommsScanner",
+  "3": "NodeApi",
+  "4": "Util",
+  "5": "MerchDb",
+  "6": "ImageLoader",
+  "7": "StateNft",
+  "8": ".view",
+  "9": "Identicon",
+  "10": "MainActivity.java",
+  "11": "QrUtil",
+  "12": "GalleryAdapter",
+  "13": "gradlew",
+  "14": "app/build.gradle",
+  "15": "build.gradle",
+  "16": "settings.gradle",
+  "17": "Context",
+  "18": "LazySodium",
+  "19": "Override",
+  "20": "TextView"
+}
