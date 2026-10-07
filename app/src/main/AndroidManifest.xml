@@ -5,7 +5,7 @@
     <!-- Node data comes from the local Minima Core node over the broadcast-Intent IPC.
          Package visibility lets us launch the node app + deliver targeted broadcasts. -->
     <queries>
-        <package android:name="org.minimarex.minimacore" />
+        <package android:name="com.eurobuddha.minimacore" />
     </queries>
 
     <!-- Token/NFT icons may be http(s)/ipfs URLs in the token metadata; node IPC stays broadcast-only. -->
